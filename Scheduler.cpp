@@ -1,30 +1,23 @@
 /*
- * Scheduling Algorithm #2 (Reactive Provisioning with Idle Consolidation):
+ * Scheduling Algorithm #3 (Adaptive Multi-Criteria Load Balancing with Idle Consolidation):
  *
- * This scheduler aims to finish tasks quickly while saving energy by:
+ * This scheduler aims to complete tasks quickly while saving energy by:
  *
  * 1. On task arrival:
- *    - Determine the task’s required CPU and VM types.
- *    - Search active machines (of the correct type) for one that is idle or lightly loaded.
- *    - If none is found, provision a new machine (i.e. create a new VM) on an inactive machine
- *      that has the required CPU type.
+ *    - Determine the task’s required CPU, VM, and memory.
+ *    - For high-priority (SLA0) tasks, attempt to provision a new machine immediately.
+ *      For other tasks, first search active machines using multi-criteria matching.
+ *    - If no active machine is eligible, provision a new machine on an inactive machine
+ *      that meets the task’s CPU requirement.
  *
  * 2. While running:
- *    - Each active machine has its load tracked.
- *    - When a machine becomes idle (load drops to 0) the time is recorded.
- *    - In periodic checks, if a machine has been idle longer than a set threshold,
- *      it is shut down (its state is set to S5 and its VM is shut down) to save energy.
+ *    - Track each machine’s load and record idle start times when load drops to zero.
+ *    - Periodically, if a machine remains idle longer than a threshold,
+ *      shut it down (transition to lowest power state and shut down its VM).
  *
  * 3. At shutdown:
- *    - All remaining active machines are set to the lowest power state and shut down.
+ *    - Set all remaining active machines to the lowest power state and shut down their VMs.
  */
-
-// SLA violation report
-// SLA0: 0%
-// SLA1: 0%
-// SLA2: 0%
-// Total Energy 0.0067847KW-Hour
-// Simulation run finished in 3.48 seconds
 
 #include "Scheduler.hpp"
 #include "Interfaces.h"
@@ -43,7 +36,7 @@ static unordered_map<TaskId_t, unsigned> taskToMachine;
 const unsigned NUM_CORES = 8;
 const CPUPerformance_t HIGHEST_PERF = P0;
 const MachineState_t LOWEST_POWER = S5;
-const Time_t IDLE_THRESHOLD = 200000;  // in microseconds
+const Time_t IDLE_THRESHOLD = 200000;  // microseconds
 
 int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm) {
     unsigned total = Machine_GetTotal();
@@ -74,17 +67,24 @@ int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm) {
     return -1;
 }
 
-int findCompatibleMachine(CPUType_t req_cpu) {
+int findCompatibleMachine(CPUType_t req_cpu, unsigned req_mem) {
     int bestIndex = -1;
-    unsigned minLoad = std::numeric_limits<unsigned>::max();
+    unsigned bestLoad = std::numeric_limits<unsigned>::max();
+    unsigned bestAvailMem = 0;
     for (unsigned i = 0; i < activeMachines.size(); i++) {
-        if (Machine_GetCPUType(activeMachines[i]) == req_cpu) {
-            if (machineLoad[i] == 0)
-                return i;
-            if (machineLoad[i] < minLoad) {
-                minLoad = machineLoad[i];
-                bestIndex = i;
-            }
+        if (Machine_GetCPUType(activeMachines[i]) != req_cpu)
+            continue;
+        MachineInfo_t info = Machine_GetInfo(activeMachines[i]);
+        unsigned availableMem = (info.memory_size > info.memory_used) ? (info.memory_size - info.memory_used) : 0;
+        if (availableMem < req_mem)
+            continue;
+        if (machineLoad[i] == 0)
+            return i;
+        if (machineLoad[i] < bestLoad ||
+           (machineLoad[i] == bestLoad && availableMem > bestAvailMem)) {
+            bestLoad = machineLoad[i];
+            bestAvailMem = availableMem;
+            bestIndex = i;
         }
     }
     return bestIndex;
@@ -100,21 +100,36 @@ void Scheduler::Init() {
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    SimOutput("Scheduler::NewTask(): Received task " + to_string(task_id) + " at time " + to_string(now), 4);
+    SimOutput("Scheduler::NewTask(): Received task " + to_string(task_id) +
+              " at time " + to_string(now), 4);
     CPUType_t task_cpu = RequiredCPUType(task_id);
     VMType_t task_vm = RequiredVMType(task_id);
+    unsigned taskMem = GetTaskMemory(task_id);
+    SLAType_t taskSLA = RequiredSLA(task_id);
     Priority_t priority = HIGH_PRIORITY;
     
-    int targetIndex = provisionNewMachine(task_cpu, task_vm);
-    if (targetIndex == -1) {
-        targetIndex = findCompatibleMachine(task_cpu);
+    int targetIndex = -1;
+    // For high priority (SLA0), try to provision a new machine first.
+    if (taskSLA == SLA0) {
+        targetIndex = provisionNewMachine(task_cpu, task_vm);
         if (targetIndex == -1) {
-            ThrowException("No active machine available with required CPU type for task " + to_string(task_id));
-            return;
+            targetIndex = findCompatibleMachine(task_cpu, taskMem);
         }
-        SimOutput("Scheduler::NewTask(): Reusing active machine " + to_string(activeMachines[targetIndex]), 3);
+        SimOutput("Scheduler::NewTask(): High priority task " + to_string(task_id) +
+                  " assigned to machine " + to_string(activeMachines[targetIndex]), 3);
+    } else {
+        targetIndex = findCompatibleMachine(task_cpu, taskMem);
+        if (targetIndex == -1) {
+            targetIndex = provisionNewMachine(task_cpu, task_vm);
+        } else {
+            SimOutput("Scheduler::NewTask(): Reusing active machine " +
+                      to_string(activeMachines[targetIndex]), 3);
+        }
     }
-    
+    if (targetIndex == -1) {
+        ThrowException("No machine available with required CPU type for task " + to_string(task_id));
+        return;
+    }
     VM_AddTask(activeVMs[targetIndex], task_id, priority);
     taskToMachine[task_id] = targetIndex;
     machineLoad[targetIndex]++;
@@ -122,7 +137,8 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
+    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) +
+              " completed at time " + to_string(now), 4);
     if (taskToMachine.find(task_id) != taskToMachine.end()) {
         unsigned machineIndex = taskToMachine[task_id];
         if (machineLoad[machineIndex] > 0)
