@@ -20,7 +20,7 @@ machine class:
         S-States: [40, 20, 16, 12, 10, 4, 0]
         P-States: [4, 2, 2, 1]
         C-States: [4, 1, 1, 0]
-        MIPS: [1500, 1200, 900, 600]
+        MIPS: [1500, 1200, 1000, 600]
         GPUs: no
 }
 
@@ -38,35 +38,3 @@ task class:
         Task type: WEB
         Seed: 520230
 }
-
-task class:
-{
-        Start time: 5000000
-        End time :  7000000
-        Inter arrival: 1000
-        Expected runtime: 3000000
-        Memory: 8
-        VM type: LINUX
-        GPU enabled: no
-        SLA type: SLA0
-        CPU type: X86
-        Task type: WEB
-        Seed: 520120
-}
-
-task class:
-{
-        Start time: 11000000
-        End time :  13000000
-        Inter arrival: 1000
-        Expected runtime: 3000000
-        Memory: 8
-        VM type: LINUX
-        GPU enabled: no
-        SLA type: SLA0
-        CPU type: X86
-        Task type: WEB
-        Seed: 520120
-}
-
-
