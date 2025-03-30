@@ -1,22 +1,20 @@
 /*
- * Scheduling Algorithm #3 (Adaptive Multi-Criteria Load Balancing with Idle Consolidation):
- *
- * This scheduler aims to complete tasks quickly while saving energy by:
+ * Scheduling Algorithm #4 (Energy-Aware Scheduling with DVS, Idle Consolidation, and High-Priority Override):
  *
  * 1. On task arrival:
  *    - Determine the task’s required CPU, VM, and memory.
- *    - For high-priority (SLA0) tasks, attempt to provision a new machine immediately.
- *      For other tasks, first search active machines using multi-criteria matching.
- *    - If no active machine is eligible, provision a new machine on an inactive machine
- *      that meets the task’s CPU requirement.
+ *    - For high-priority (SLA0) tasks, try to provision a new machine first.
+ *    - Otherwise, or if provisioning fails, select an active machine using weighted load/memory matching.
+ *    - Assign the task and, if SLA0, mark the machine as high-priority.
  *
- * 2. While running:
- *    - Track each machine’s load and record idle start times when load drops to zero.
- *    - Periodically, if a machine remains idle longer than a threshold,
- *      shut it down (transition to lowest power state and shut down its VM).
+ * 2. During operation:
+ *    - Adjust each machine's performance state based on load:
+ *         * If any SLA0 tasks are active on the machine, set it to P0.
+ *         * Otherwise, use the load ratio to choose among P0, P1, and P2.
+ *    - Record idle times and shut down machines idle beyond a threshold.
  *
  * 3. At shutdown:
- *    - Set all remaining active machines to the lowest power state and shut down their VMs.
+ *    - Transition all active machines to the lowest power state and shut down their VMs.
  */
 
 #include "Scheduler.hpp"
@@ -31,6 +29,7 @@ static vector<VMId_t> activeVMs;
 static vector<MachineId_t> activeMachines;
 static vector<unsigned> machineLoad;
 static vector<Time_t> machineIdleStart;
+static vector<unsigned> machineHighPriorityCount;
 static unordered_map<TaskId_t, unsigned> taskToMachine;
 
 const unsigned NUM_CORES = 8;
@@ -43,10 +42,7 @@ int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm) {
     for (MachineId_t id = 0; id < total; id++) {
         bool alreadyActive = false;
         for (MachineId_t activeId : activeMachines) {
-            if (activeId == id) {
-                alreadyActive = true;
-                break;
-            }
+            if (activeId == id) { alreadyActive = true; break; }
         }
         if (!alreadyActive) {
             if (Machine_GetCPUType(id) != req_cpu)
@@ -60,6 +56,7 @@ int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm) {
             activeVMs.push_back(newVM);
             machineLoad.push_back(0);
             machineIdleStart.push_back(0);
+            machineHighPriorityCount.push_back(0);
             SimOutput("Scheduler::Provision: Activated machine " + to_string(id), 3);
             return activeMachines.size() - 1;
         }
@@ -80,8 +77,7 @@ int findCompatibleMachine(CPUType_t req_cpu, unsigned req_mem) {
             continue;
         if (machineLoad[i] == 0)
             return i;
-        if (machineLoad[i] < bestLoad ||
-           (machineLoad[i] == bestLoad && availableMem > bestAvailMem)) {
+        if (machineLoad[i] < bestLoad || (machineLoad[i] == bestLoad && availableMem > bestAvailMem)) {
             bestLoad = machineLoad[i];
             bestAvailMem = availableMem;
             bestIndex = i;
@@ -90,18 +86,41 @@ int findCompatibleMachine(CPUType_t req_cpu, unsigned req_mem) {
     return bestIndex;
 }
 
+void adjustPerformanceState() {
+    for (unsigned i = 0; i < activeMachines.size(); i++) {
+        CPUPerformance_t newState;
+        if (machineHighPriorityCount[i] > 0) {
+            newState = P0;
+        } else if (machineLoad[i] > 0) {
+            MachineInfo_t info = Machine_GetInfo(activeMachines[i]);
+            double ratio = (double)machineLoad[i] / (double)info.num_cpus;
+            if (ratio >= 0.7)
+                newState = P0;
+            else if (ratio >= 0.3)
+                newState = P1;
+            else
+                newState = P2;
+        } else {
+            continue;
+        }
+        for (unsigned core = 0; core < Machine_GetInfo(activeMachines[i]).num_cpus; core++) {
+            Machine_SetCorePerformance(activeMachines[i], core, newState);
+        }
+    }
+}
+
 void Scheduler::Init() {
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
     activeVMs.clear();
     activeMachines.clear();
     machineLoad.clear();
     machineIdleStart.clear();
+    machineHighPriorityCount.clear();
     taskToMachine.clear();
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    SimOutput("Scheduler::NewTask(): Received task " + to_string(task_id) +
-              " at time " + to_string(now), 4);
+    SimOutput("Scheduler::NewTask(): Received task " + to_string(task_id) + " at time " + to_string(now), 4);
     CPUType_t task_cpu = RequiredCPUType(task_id);
     VMType_t task_vm = RequiredVMType(task_id);
     unsigned taskMem = GetTaskMemory(task_id);
@@ -109,22 +128,14 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     Priority_t priority = HIGH_PRIORITY;
     
     int targetIndex = -1;
-    // For high priority (SLA0), try to provision a new machine first.
     if (taskSLA == SLA0) {
         targetIndex = provisionNewMachine(task_cpu, task_vm);
-        if (targetIndex == -1) {
+        if (targetIndex == -1)
             targetIndex = findCompatibleMachine(task_cpu, taskMem);
-        }
-        SimOutput("Scheduler::NewTask(): High priority task " + to_string(task_id) +
-                  " assigned to machine " + to_string(activeMachines[targetIndex]), 3);
     } else {
         targetIndex = findCompatibleMachine(task_cpu, taskMem);
-        if (targetIndex == -1) {
+        if (targetIndex == -1)
             targetIndex = provisionNewMachine(task_cpu, task_vm);
-        } else {
-            SimOutput("Scheduler::NewTask(): Reusing active machine " +
-                      to_string(activeMachines[targetIndex]), 3);
-        }
     }
     if (targetIndex == -1) {
         ThrowException("No machine available with required CPU type for task " + to_string(task_id));
@@ -134,15 +145,18 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     taskToMachine[task_id] = targetIndex;
     machineLoad[targetIndex]++;
     machineIdleStart[targetIndex] = 0;
+    if (taskSLA == SLA0)
+        machineHighPriorityCount[targetIndex]++;
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) +
-              " completed at time " + to_string(now), 4);
+    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
     if (taskToMachine.find(task_id) != taskToMachine.end()) {
         unsigned machineIndex = taskToMachine[task_id];
         if (machineLoad[machineIndex] > 0)
             machineLoad[machineIndex]--;
+        if (RequiredSLA(task_id) == SLA0 && machineHighPriorityCount[machineIndex] > 0)
+            machineHighPriorityCount[machineIndex]--;
         taskToMachine.erase(task_id);
         if (machineLoad[machineIndex] == 0)
             machineIdleStart[machineIndex] = now;
@@ -150,6 +164,7 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
+    adjustPerformanceState();
     for (int i = activeMachines.size() - 1; i >= 0; i--) {
         if (machineLoad[i] == 0 && machineIdleStart[i] != 0 && (now - machineIdleStart[i] >= IDLE_THRESHOLD)) {
             SimOutput("Scheduler::PeriodicCheck(): Shutting down idle machine " + to_string(activeMachines[i]), 3);
@@ -159,6 +174,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
             activeVMs.erase(activeVMs.begin() + i);
             machineLoad.erase(machineLoad.begin() + i);
             machineIdleStart.erase(machineIdleStart.begin() + i);
+            machineHighPriorityCount.erase(machineHighPriorityCount.begin() + i);
         }
     }
 }
