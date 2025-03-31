@@ -1,24 +1,3 @@
-/*
- * Scheduling Algorithm #3 (Adaptive Multi-Criteria Load Balancing with Idle Consolidation):
- *
- * This scheduler aims to complete tasks quickly while saving energy by:
- *
- * 1. On task arrival:
- *    - Determine the task’s required CPU, VM, and memory.
- *    - For high-priority (SLA0) tasks, attempt to provision a new machine immediately.
- *      For other tasks, first search active machines using multi-criteria matching.
- *    - If no active machine is eligible, provision a new machine on an inactive machine
- *      that meets the task’s CPU requirement.
- *
- * 2. While running:
- *    - Track each machine’s load and record idle start times when load drops to zero.
- *    - Periodically, if a machine remains idle longer than a threshold,
- *      shut it down (transition to lowest power state and shut down its VM).
- *
- * 3. At shutdown:
- *    - Set all remaining active machines to the lowest power state and shut down their VMs.
- */
-
 #include "Scheduler.hpp"
 #include "Interfaces.h"
 #include <vector>
@@ -36,7 +15,7 @@ static unordered_map<TaskId_t, unsigned> taskToMachine;
 const unsigned NUM_CORES = 8;
 const CPUPerformance_t HIGHEST_PERF = P0;
 const MachineState_t LOWEST_POWER = S5;
-const Time_t IDLE_THRESHOLD = 200000;  // microseconds
+const Time_t IDLE_THRESHOLD = 200000;
 
 int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm) {
     unsigned total = Machine_GetTotal();
@@ -109,7 +88,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     Priority_t priority = HIGH_PRIORITY;
     
     int targetIndex = -1;
-    // For high priority (SLA0), try to provision a new machine first.
     if (taskSLA == SLA0) {
         targetIndex = provisionNewMachine(task_cpu, task_vm);
         if (targetIndex == -1) {
