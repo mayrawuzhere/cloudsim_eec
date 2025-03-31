@@ -1,32 +1,21 @@
-//  pMapper Scheduler Algorithm:
-//    - Sorts machines by energy consumption.
-//    - Places tasks on machines based on available memory and task capacity.
-//    - Offloads tasks from overloaded machines to prevent memory overcommitment.
-//    - Prioritizes high-priority tasks (e.g., tasks 0 and 64) to meet SLA requirements.
-
 #include "Scheduler.hpp"
 #include <algorithm>
 #include <vector>
 #include <unordered_map>
 #include <limits>
 #include <string>
-
 using namespace std;
 
 static const VMId_t INVALID_VM = (VMId_t)(-1);
-
 static bool migrating = false;
 static unsigned active_machines = 16;
-
 static vector<MachineId_t> sorted_machines;
 static vector<unsigned> machine_util;
 static vector<unsigned> machine_mem_usage;
 static vector<unsigned> machine_mem_capacity;
-
 static vector<VMId_t> vms;
 static unordered_map<VMId_t, MachineId_t> vm_location;
 static unordered_map<VMId_t, vector<TaskId_t>> vm_tasks;
-
 static const unsigned MAX_TASKS_PER_VM = 10;
 
 static double GetMachineEnergy(MachineId_t m) {
@@ -130,23 +119,18 @@ static VMId_t PlaceTask_PMapper(TaskId_t task_id, Priority_t priority) {
     return INVALID_VM;
 }
 
-
 void Scheduler::Init() {
     SimOutput("Scheduler::Init(): Initializing pMapper scheduler", 1);
-    
     SortMachinesByEnergy();
     unsigned total = Machine_GetTotal();
-    
     machine_util.resize(total, 0);
     machine_mem_usage.resize(total, 0);
     machine_mem_capacity.resize(total, 0);
-    
     for (unsigned m = 0; m < total; m++) {
         MachineInfo_t info = Machine_GetInfo(m);
         machine_mem_capacity[m] = info.memory_size;
         machine_mem_usage[m] = info.memory_used;
     }
-    
     for (unsigned i = 0; i < active_machines && i < sorted_machines.size(); i++) {
         MachineId_t m = sorted_machines[i];
         Machine_SetState(m, S0);
@@ -215,34 +199,27 @@ void Scheduler::Shutdown(Time_t time) {
 }
 
 static Scheduler Scheduler;
-
 void InitScheduler() {
     SimOutput("InitScheduler(): Starting pMapper scheduler", 4);
     Scheduler.Init();
 }
-
 void HandleNewTask(Time_t time, TaskId_t task_id) {
     Scheduler.NewTask(time, task_id);
 }
-
 void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
     Scheduler.TaskComplete(time, task_id);
 }
-
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
     SimOutput("MemoryWarning(): Memory overflow on machine " + to_string(machine_id) +
               " at time " + to_string(time), 0);
     OffloadTaskFromMachine(machine_id);
 }
-
 void MigrationDone(Time_t time, VMId_t vm_id) {
     Scheduler.MigrationComplete(time, vm_id);
 }
-
 void SchedulerCheck(Time_t time) {
     Scheduler.PeriodicCheck(time);
 }
-
 void SimulationComplete(Time_t time) {
     cout << "SLA0: " << GetSLAReport(SLA0) << "%" << endl;
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
@@ -251,10 +228,8 @@ void SimulationComplete(Time_t time) {
     cout << "Simulation run finished at " << double(time) / 1000000 << " seconds" << endl;
     Scheduler.Shutdown(time);
 }
-
 void SLAWarning(Time_t time, TaskId_t task_id) {
     SimOutput("SLAWarning(): Warning for task " + to_string(task_id) +
               " at time " + to_string(time), 0);
 }
-
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {}
