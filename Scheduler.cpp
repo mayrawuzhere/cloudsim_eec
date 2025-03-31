@@ -1,31 +1,3 @@
-/*
- * Scheduling Algorithm #2 (Reactive Provisioning with Idle Consolidation):
- *
- * This scheduler aims to finish tasks quickly while saving energy by:
- *
- * 1. On task arrival:
- *    - Determine the task’s required CPU and VM types.
- *    - Search active machines (of the correct type) for one that is idle or lightly loaded.
- *    - If none is found, provision a new machine (i.e. create a new VM) on an inactive machine
- *      that has the required CPU type.
- *
- * 2. While running:
- *    - Each active machine has its load tracked.
- *    - When a machine becomes idle (load drops to 0) the time is recorded.
- *    - In periodic checks, if a machine has been idle longer than a set threshold,
- *      it is shut down (its state is set to S5 and its VM is shut down) to save energy.
- *
- * 3. At shutdown:
- *    - All remaining active machines are set to the lowest power state and shut down.
- */
-
-// SLA violation report
-// SLA0: 0%
-// SLA1: 0%
-// SLA2: 0%
-// Total Energy 0.0067847KW-Hour
-// Simulation run finished in 3.48 seconds
-
 #include "Scheduler.hpp"
 #include "Interfaces.h"
 #include <vector>
@@ -43,7 +15,7 @@ static unordered_map<TaskId_t, unsigned> taskToMachine;
 const unsigned NUM_CORES = 8;
 const CPUPerformance_t HIGHEST_PERF = P0;
 const MachineState_t LOWEST_POWER = S5;
-const Time_t IDLE_THRESHOLD = 200000;  // in microseconds
+const Time_t IDLE_THRESHOLD = 200000;
 
 int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm) {
     unsigned total = Machine_GetTotal();
@@ -104,7 +76,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     CPUType_t task_cpu = RequiredCPUType(task_id);
     VMType_t task_vm = RequiredVMType(task_id);
     Priority_t priority = HIGH_PRIORITY;
-    
     int targetIndex = provisionNewMachine(task_cpu, task_vm);
     if (targetIndex == -1) {
         targetIndex = findCompatibleMachine(task_cpu);
@@ -114,7 +85,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         }
         SimOutput("Scheduler::NewTask(): Reusing active machine " + to_string(activeMachines[targetIndex]), 3);
     }
-    
     VM_AddTask(activeVMs[targetIndex], task_id, priority);
     taskToMachine[task_id] = targetIndex;
     machineLoad[targetIndex]++;
