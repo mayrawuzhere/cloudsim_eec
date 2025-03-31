@@ -1,44 +1,10 @@
-/*
- * Scheduling Algorithm #1 (greedy based on task count):
- *
- * This scheduler uses a simple load-balancing approach to assign tasks.
- *
- * 1. Determine Task Priority:
- *    - Tasks with IDs 0 and 64 are considered high priority.
- *    - All other tasks are considered mid priority.
- *
- * 2. Select the Least-Loaded Machine:
- *    - For each new task (regardless of priority), the scheduler loops through all active machines.
- *    - It selects the machine that currently has the fewest tasks running.
- *
- * 3. Assign Task and Update Load:
- *    - The task is assigned to the selected machine.
- *    - The machine's load counter is increased.
- *
- * 4. Update on Task Completion:
- *    - When a task completes, the corresponding machine's load counter is decreased.
- *
- * This straightforward, greedy load-balancing approach ensures that no machine
- * becomes overloaded, which helps in preventing any SLA violations.
- */
-
-// SLA violation report
-// SLA0: 0%
-// SLA1: 0%
-// SLA2: 0%
-// Total Energy 0.0067847KW-Hour
-// Simulation run finished in 3.48 seconds
-
 #include "Scheduler.hpp"
 #include <vector>
 #include <unordered_map>
 using namespace std;
 
-// Constants and global variables remain for compatibility, though some are no longer used.
 static bool migrating = false;
 static unsigned active_machines = 16;
-
-// Global load counters and task mapping
 static vector<unsigned> machineLoad;
 static unordered_map<TaskId_t, unsigned> taskToMachine;
 
@@ -54,7 +20,6 @@ void Scheduler::Init() {
         VM_Attach(vms[i], machines[i]);
     }
     
-    // Initialize load counters for each active machine
     machineLoad.resize(active_machines, 0);
 
     bool dynamic = false;
@@ -62,7 +27,6 @@ void Scheduler::Init() {
         for (unsigned i = 0; i < 4; i++)
             for (unsigned j = 0; j < 8; j++)
                 Machine_SetCorePerformance(MachineId_t(0), j, P3);
-    // Turn off the ARM machines
     for (unsigned i = 24; i < Machine_GetTotal(); i++)
         Machine_SetState(MachineId_t(i), S5);
 
@@ -70,14 +34,11 @@ void Scheduler::Init() {
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    // Update your data structure. The VM now can receive new tasks.
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    // Determine task priority
     Priority_t priority = (task_id == 0 || task_id == 64) ? HIGH_PRIORITY : MID_PRIORITY;
     
-    // For both high- and mid-priority tasks, always choose the machine with the lowest load.
     unsigned targetMachine = 0;
     unsigned minLoad = machineLoad[0];
     for (unsigned i = 1; i < active_machines; i++) {
@@ -92,7 +53,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
-
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -159,9 +119,7 @@ void SimulationComplete(Time_t time) {
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    
 }
