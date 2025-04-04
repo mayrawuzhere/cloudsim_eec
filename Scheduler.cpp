@@ -72,7 +72,7 @@ void Scheduler::Init() {
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    SimOutput("Scheduler::NewTask(): Received task " + to_string(task_id) + " at time " + to_string(now), 4);
+    SimOutput("Scheduler::NewTask(): Received task " + to_string(task_id) + " at time " + to_string(now), 3);
     CPUType_t task_cpu = RequiredCPUType(task_id);
     VMType_t task_vm = RequiredVMType(task_id);
     Priority_t priority = HIGH_PRIORITY;
@@ -86,13 +86,14 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         SimOutput("Scheduler::NewTask(): Reusing active machine " + to_string(activeMachines[targetIndex]), 3);
     }
     VM_AddTask(activeVMs[targetIndex], task_id, priority);
+    SimOutput("Scheduler::NewTask(): Add task " + to_string(task_id) + " to machine " + to_string(activeVMs[targetIndex]), 3);
     taskToMachine[task_id] = targetIndex;
     machineLoad[targetIndex]++;
     machineIdleStart[targetIndex] = 0;
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " completed at time " + to_string(now), 4);
+    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " completed at time " + to_string(now), 3);
     if (taskToMachine.find(task_id) != taskToMachine.end()) {
         unsigned machineIndex = taskToMachine[task_id];
         if (machineLoad[machineIndex] > 0)
@@ -105,9 +106,12 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 
 void Scheduler::PeriodicCheck(Time_t now) {
     for (int i = activeMachines.size() - 1; i >= 0; i--) {
-        if (machineLoad[i] == 0 && machineIdleStart[i] != 0 && (now - machineIdleStart[i] >= IDLE_THRESHOLD)) {
+        MachineInfo_t machine_info = Machine_GetInfo(i); 
+        if (machine_info.active_tasks == 0 && machine_info.active_vms == 0 && 
+                machineIdleStart[i] != 0 && (now - machineIdleStart[i] >= IDLE_THRESHOLD)) {
             SimOutput("Scheduler::PeriodicCheck(): Shutting down idle machine " + to_string(activeMachines[i]), 3);
             Machine_SetState(activeMachines[i], LOWEST_POWER);
+            VMInfo_t vm_info = VM_GetInfo(activeVMs[i]);
             VM_Shutdown(activeVMs[i]);
             activeMachines.erase(activeMachines.begin() + i);
             activeVMs.erase(activeVMs.begin() + i);
@@ -124,7 +128,7 @@ void Scheduler::Shutdown(Time_t time) {
         Machine_SetState(activeMachines[i], LOWEST_POWER);
         VM_Shutdown(activeVMs[i]);
     }
-    SimOutput("Scheduler::Shutdown(): Shutdown complete at time " + to_string(time), 4);
+    SimOutput("Scheduler::Shutdown(): Shutdown complete at time " + to_string(time), 3);
 }
 
 static Scheduler SchedulerInstance;
