@@ -18,6 +18,7 @@ const MachineState_t LOWEST_POWER = S5;
 const Time_t IDLE_THRESHOLD = 200000;
 
 int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm) {
+    SimOutput("Provisioning a New Machine.", 3);
     unsigned total = Machine_GetTotal();
     for (MachineId_t id = 0; id < total; id++) {
         bool alreadyActive = false;
@@ -86,9 +87,11 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     unsigned taskMem = GetTaskMemory(task_id);
     SLAType_t taskSLA = RequiredSLA(task_id);
     Priority_t priority = HIGH_PRIORITY;
+
     
     int targetIndex = -1;
     if (taskSLA == SLA0) {
+        
         targetIndex = provisionNewMachine(task_cpu, task_vm);
         if (targetIndex == -1) {
             targetIndex = findCompatibleMachine(task_cpu, taskMem);
@@ -100,10 +103,11 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         if (targetIndex == -1) {
             targetIndex = provisionNewMachine(task_cpu, task_vm);
         } else {
-            SimOutput("Scheduler::NewTask(): Reusing active machine " +
-                      to_string(activeMachines[targetIndex]), 3);
+            /*SimOutput("Scheduler::NewTask(): Reusing active machine " +
+                      to_string(activeMachines[targetIndex]), 3);*/
         }
     }
+    SimOutput("Scheduler::NewTask(): Task CPU_Type: " + to_string(task_cpu), 4);
     if (targetIndex == -1) {
         ThrowException("No machine available with required CPU type for task " + to_string(task_id));
         return;
@@ -129,7 +133,10 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 
 void Scheduler::PeriodicCheck(Time_t now) {
     for (int i = activeMachines.size() - 1; i >= 0; i--) {
-        if (machineLoad[i] == 0 && machineIdleStart[i] != 0 && (now - machineIdleStart[i] >= IDLE_THRESHOLD)) {
+        MachineInfo_t machine_info = Machine_GetInfo(i); 
+        if (machine_info.active_tasks == 0 && machine_info.active_vms == 0 
+            && machineLoad[i] == 0 && machineIdleStart[i] != 0 && 
+                (now - machineIdleStart[i] >= IDLE_THRESHOLD)) {
             SimOutput("Scheduler::PeriodicCheck(): Shutting down idle machine " + to_string(activeMachines[i]), 3);
             Machine_SetState(activeMachines[i], LOWEST_POWER);
             VM_Shutdown(activeVMs[i]);
