@@ -4,6 +4,8 @@
 #include <unordered_map>
 #include <string>
 #include <limits>
+#include <unordered_set>
+#include <queue>
 using namespace std;
 
 static vector<VMId_t> activeVMs;
@@ -11,11 +13,15 @@ static vector<MachineId_t> activeMachines;
 static vector<unsigned> machineLoad;
 static vector<Time_t> machineIdleStart;
 static unordered_map<TaskId_t, unsigned> taskToMachine;
+static vector<pair<VMId_t, MachineId_t>> pending_vm_attachments;
+static std::unordered_set<MachineId_t> waking_up_machines;
+static std::queue<TaskId_t> deferred_tasks;
 
 const unsigned NUM_CORES = 8;
 const CPUPerformance_t HIGHEST_PERF = P0;
 const MachineState_t LOWEST_POWER = S5;
 const Time_t IDLE_THRESHOLD = 200000;
+const MachineId_t INVALID_MACHINE = static_cast<MachineId_t>(-1);
 
 int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm) {
     SimOutput("Provisioning a New Machine.", 3);
@@ -28,9 +34,18 @@ int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm) {
                 break;
             }
         }
-        if (!alreadyActive) {
-            if (Machine_GetCPUType(id) != req_cpu)
-                continue;
+        if (!alreadyActive && Machine_GetCPUType(id) == req_cpu) {
+            MachineInfo_t info = Machine_GetInfo(id);
+            if (info.s_state != S0) {
+                Machine_SetState(id, S0);
+                waking_up_machines.insert(id);
+
+                VMId_t vm_id = VM_Create(req_vm, req_cpu);
+                pending_vm_attachments.push_back(make_pair(vm_id, id));
+                SimOutput("Scheduler::Provision(): Waking up machine " + to_string(id), 3);
+                SimOutput("Scheduler::PeriodicCheck(): Machine " + to_string(waking_up_machines.count(id)) + " is waking up", 3);
+                return -1;
+            }
             VMId_t newVM = VM_Create(req_vm, req_cpu);
             VM_Attach(newVM, id);
             for (unsigned core = 0; core < NUM_CORES; core++) {
@@ -41,7 +56,7 @@ int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm) {
             machineLoad.push_back(0);
             machineIdleStart.push_back(0);
             SimOutput("Scheduler::Provision: Activated machine " + to_string(id), 3);
-            return activeMachines.size() - 1;
+            return id;
         }
     }
     return -1;
@@ -53,6 +68,8 @@ int findCompatibleMachine(CPUType_t req_cpu, unsigned req_mem) {
     unsigned bestAvailMem = 0;
     for (unsigned i = 0; i < activeMachines.size(); i++) {
         if (Machine_GetCPUType(activeMachines[i]) != req_cpu)
+            continue;
+        if (waking_up_machines.count(activeMachines[i]))
             continue;
         MachineInfo_t info = Machine_GetInfo(activeMachines[i]);
         unsigned availableMem = (info.memory_size > info.memory_used) ? (info.memory_size - info.memory_used) : 0;
@@ -80,42 +97,56 @@ void Scheduler::Init() {
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    SimOutput("Scheduler::NewTask(): Received task " + to_string(task_id) +
-              " at time " + to_string(now), 4);
+    SimOutput("Scheduler::NewTask(): Received task " + to_string(task_id) + " at time " + to_string(now), 4);
     CPUType_t task_cpu = RequiredCPUType(task_id);
     VMType_t task_vm = RequiredVMType(task_id);
     unsigned taskMem = GetTaskMemory(task_id);
     SLAType_t taskSLA = RequiredSLA(task_id);
     Priority_t priority = HIGH_PRIORITY;
 
-    
-    int targetIndex = -1;
+    MachineId_t targetMachine = INVALID_MACHINE;
+    int machineIndex = -1;
+
     if (taskSLA == SLA0) {
-        
-        targetIndex = provisionNewMachine(task_cpu, task_vm);
-        if (targetIndex == -1) {
-            targetIndex = findCompatibleMachine(task_cpu, taskMem);
+        targetMachine = provisionNewMachine(task_cpu, task_vm);
+        if (targetMachine == INVALID_MACHINE) {
+            machineIndex = findCompatibleMachine(task_cpu, taskMem);
+            if (machineIndex != -1)
+                targetMachine = activeMachines[machineIndex];
         }
-        SimOutput("Scheduler::NewTask(): High priority task " + to_string(task_id) +
-                  " assigned to machine " + to_string(activeMachines[targetIndex]), 3);
     } else {
-        targetIndex = findCompatibleMachine(task_cpu, taskMem);
-        if (targetIndex == -1) {
-            targetIndex = provisionNewMachine(task_cpu, task_vm);
+        machineIndex = findCompatibleMachine(task_cpu, taskMem);
+        if (machineIndex != -1) {
+            targetMachine = activeMachines[machineIndex];
         } else {
-            /*SimOutput("Scheduler::NewTask(): Reusing active machine " +
-                      to_string(activeMachines[targetIndex]), 3);*/
+            targetMachine = provisionNewMachine(task_cpu, task_vm);
         }
     }
-    SimOutput("Scheduler::NewTask(): Task CPU_Type: " + to_string(task_cpu), 4);
-    if (targetIndex == -1) {
-        ThrowException("No machine available with required CPU type for task " + to_string(task_id));
+
+    if (targetMachine == INVALID_MACHINE) {
+        SimOutput("Scheduler::NewTask(): No machine available, deferring task " + to_string(task_id), 3);
+        deferred_tasks.push(task_id);
         return;
     }
-    VM_AddTask(activeVMs[targetIndex], task_id, priority);
-    taskToMachine[task_id] = targetIndex;
-    machineLoad[targetIndex]++;
-    machineIdleStart[targetIndex] = 0;
+
+    // Find the VM attached to this machine
+    int vmIndex = -1;
+    for (unsigned i = 0; i < activeMachines.size(); ++i) {
+        if (activeMachines[i] == targetMachine) {
+            vmIndex = i;
+            break;
+        }
+    }
+    if (vmIndex == -1) {
+        ThrowException("Failed to find VM for machine " + to_string(targetMachine));
+        return;
+    }
+
+    SimOutput("Scheduler::NewTask(): Assigning task " + to_string(task_id) + " to machine " + to_string(targetMachine), 3);
+    VM_AddTask(activeVMs[vmIndex], task_id, priority);
+    taskToMachine[task_id] = vmIndex;
+    machineLoad[vmIndex]++;
+    machineIdleStart[vmIndex] = 0;
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
@@ -133,12 +164,18 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 
 void Scheduler::PeriodicCheck(Time_t now) {
     for (int i = activeMachines.size() - 1; i >= 0; i--) {
-        MachineInfo_t machine_info = Machine_GetInfo(i); 
+        MachineId_t machine_id = activeMachines[i];
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id); 
+
+        if (waking_up_machines.count(machine_id))
+            continue; // 🚀 Machine is waking up, DO NOT shut down yet!
+
         if (machine_info.active_tasks == 0 && machine_info.active_vms == 0 
             && machineLoad[i] == 0 && machineIdleStart[i] != 0 && 
-                (now - machineIdleStart[i] >= IDLE_THRESHOLD)) {
-            SimOutput("Scheduler::PeriodicCheck(): Shutting down idle machine " + to_string(activeMachines[i]), 3);
-            Machine_SetState(activeMachines[i], LOWEST_POWER);
+            (now - machineIdleStart[i] >= IDLE_THRESHOLD)) {
+                    
+            SimOutput("Scheduler::PeriodicCheck(): Shutting down idle machine " + to_string(machine_id), 3);
+            Machine_SetState(machine_id, LOWEST_POWER);
             VM_Shutdown(activeVMs[i]);
             activeMachines.erase(activeMachines.begin() + i);
             activeVMs.erase(activeVMs.begin() + i);
@@ -147,6 +184,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
         }
     }
 }
+
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) { }
 
@@ -202,4 +240,51 @@ void SimulationComplete(Time_t time) {
 
 void SLAWarning(Time_t time, TaskId_t task_id) { }
 
-void StateChangeComplete(Time_t time, MachineId_t machine_id) { }
+void StateChangeComplete(Time_t time, MachineId_t machine_id) { 
+    SimOutput("StateChangeComplete(): Machine " + to_string(machine_id) + " is now ON", 3);
+    for (auto it = pending_vm_attachments.begin(); it != pending_vm_attachments.end(); ++it) {
+        auto [vm_id, id] = *it;
+        if (id == machine_id) {
+            try {
+                VM_Attach(vm_id, machine_id);
+                for (unsigned core = 0; core < NUM_CORES; core++) {
+                    Machine_SetCorePerformance(machine_id, core, HIGHEST_PERF);
+                }
+                activeMachines.push_back(machine_id);
+                activeVMs.push_back(vm_id);
+                machineLoad.push_back(0);
+                machineIdleStart.push_back(0);
+                waking_up_machines.erase(machine_id);
+                SimOutput("Scheduler::StateChangeComplete: Attached VM " + to_string(vm_id) + " to machine " + to_string(machine_id), 3);
+                pending_vm_attachments.erase(it);
+                // Attempt to assign any deferred tasks now that the machine is ready
+                std::queue<TaskId_t> remaining_tasks;
+                while (!deferred_tasks.empty()) {
+                    TaskId_t task_id = deferred_tasks.front();
+                    deferred_tasks.pop();
+
+                    CPUType_t cpu = RequiredCPUType(task_id);
+                    unsigned mem = GetTaskMemory(task_id);
+
+                    if (Machine_GetCPUType(machine_id) == cpu) {
+                        MachineInfo_t info = Machine_GetInfo(machine_id);
+                        unsigned availableMem = info.memory_size - info.memory_used;
+                        if (availableMem >= mem) {
+                            VM_AddTask(vm_id, task_id, HIGH_PRIORITY);
+                            taskToMachine[task_id] = activeMachines.size() - 1;
+                            machineLoad.back()++;
+                            machineIdleStart.back() = 0;
+                            SimOutput("Scheduler::StateChangeComplete(): Assigned deferred task " + to_string(task_id), 3);
+                            continue;
+                        }
+                    }
+                    remaining_tasks.push(task_id); // Still can't be placed
+                }
+                deferred_tasks = remaining_tasks;
+            } catch (...) {
+                SimOutput("StateChangeComplete(): Attach failed for VM " + to_string(vm_id), 3);
+            }
+            break;
+        }
+    }
+}
