@@ -17,6 +17,8 @@ static vector<VMId_t> vms;
 static unordered_map<VMId_t, MachineId_t> vm_location;
 static unordered_map<VMId_t, vector<TaskId_t>> vm_tasks;
 static const unsigned MAX_TASKS_PER_VM = 10;
+const Time_t IDLE_GRACE_PERIOD = 100000; // 0.1 seconds or adjust as needed
+static bool offloading_in_progress = false;
 
 static double GetMachineEnergy(MachineId_t m) {
     return static_cast<double>(Machine_GetEnergy(m));
@@ -38,40 +40,53 @@ static bool MachineHasCapacity(MachineId_t m) {
     return machine_util[m] < MAX_TASKS_PER_VM;
 }
 
-static VMId_t PlaceTask_PMapper(TaskId_t task_id, Priority_t priority);
+static VMId_t PlaceTask_PMapper(TaskId_t task_id, Priority_t priority, MachineId_t original_machine);
 
-static void OffloadTaskFromMachine(MachineId_t m) {
-    for (auto &entry : vm_location) {
+static bool OffloadTaskFromMachine(MachineId_t m) {
+    // Step 1: Gather VMs on this machine
+    vector<VMId_t> candidate_vms;
+    for (const auto& entry : vm_location) {
         if (entry.second == m) {
-            VMId_t vm = entry.first;
-            vector<TaskId_t>& tasks = vm_tasks[vm];
-            if (!tasks.empty()) {
-                TaskId_t task_to_offload = tasks.front();
-                tasks.erase(tasks.begin());
-                unsigned mem = GetTaskMemory(task_to_offload);
-                if (machine_mem_usage[m] >= mem)
-                    machine_mem_usage[m] -= mem;
-                else
-                    machine_mem_usage[m] = 0;
+            candidate_vms.push_back(entry.first);
+        }
+    }
+
+    // Step 2: For each VM, try to offload one task
+    for (VMId_t vm : candidate_vms) {
+        auto& tasks = vm_tasks[vm];
+
+        for (auto it = tasks.begin(); it != tasks.end(); ) {
+            TaskId_t task_to_offload = *it;
+            SimOutput("Trying to offload task " + to_string(task_to_offload) + " from machine " + to_string(m), 3);
+
+            Priority_t offload_priority = ((task_to_offload == 0 || task_to_offload == 64) ? HIGH_PRIORITY : MID_PRIORITY);
+            VMId_t new_vm = PlaceTask_PMapper(task_to_offload, offload_priority, m);
+
+            if (new_vm != INVALID_VM) {
                 VM_RemoveTask(vm, task_to_offload);
-                Priority_t offload_priority = ((task_to_offload == 0 || task_to_offload == 64) ? HIGH_PRIORITY : MID_PRIORITY);
-                VMId_t new_vm = PlaceTask_PMapper(task_to_offload, offload_priority);
-                if (new_vm != INVALID_VM) {
-                    SimOutput("Offloaded task " + to_string(task_to_offload) +
-                              " from machine " + to_string(m) +
-                              " to machine " + to_string(vm_location[new_vm]), 2);
-                } else {
-                    SimOutput("Offload failed for task " + to_string(task_to_offload), 0);
-                }
-                break;
+                it = tasks.erase(it);
+                unsigned mem = GetTaskMemory(task_to_offload);
+                machine_mem_usage[m] = (machine_mem_usage[m] >= mem) ? (machine_mem_usage[m] - mem) : 0;
+
+                SimOutput("Offloaded task " + to_string(task_to_offload) +
+                          " from machine " + to_string(m) +
+                          " to machine " + to_string(vm_location[new_vm]), 3);
+                return true;
+            } else {
+                ++it;
             }
         }
     }
+
+    return false;
 }
 
-static VMId_t PlaceTask_PMapper(TaskId_t task_id, Priority_t priority) {
+
+
+static VMId_t PlaceTask_PMapper(TaskId_t task_id, Priority_t priority, MachineId_t original_machine) {
     unsigned taskMem = GetTaskMemory(task_id);
     const unsigned max_attempts = 3;
+
     for (unsigned attempt = 0; attempt < max_attempts; attempt++) {
         for (auto m : sorted_machines) {
             MachineInfo_t info = Machine_GetInfo(m);
@@ -79,6 +94,10 @@ static VMId_t PlaceTask_PMapper(TaskId_t task_id, Priority_t priority) {
                 Machine_SetState(m, S0);
             }
             if (machine_mem_usage[m] + taskMem > machine_mem_capacity[m])
+                continue;
+            if (info.cpu != RequiredCPUType(task_id))
+                continue;
+            if (m == original_machine)
                 continue;
             if (MachineHasCapacity(m)) {
                 for (auto vm : vms) {
@@ -102,22 +121,40 @@ static VMId_t PlaceTask_PMapper(TaskId_t task_id, Priority_t priority) {
                 return new_vm;
             }
         }
-        double worst_ratio = 0.0;
-        MachineId_t target = (MachineId_t)(-1);
-        for (auto m : sorted_machines) {
-            double ratio = double(machine_mem_usage[m]) / (machine_mem_capacity[m] ? machine_mem_capacity[m] : 1);
-            if (ratio > worst_ratio && ratio < 1.0) {
-                worst_ratio = ratio;
-                target = m;
+
+        // ------- PROTECT THIS --------
+        if (!offloading_in_progress) {
+            offloading_in_progress = true;
+            double worst_ratio = 0.0;
+            MachineId_t target = (MachineId_t)(-1);
+            for (auto m : sorted_machines) {
+                double ratio = double(machine_mem_usage[m]) / (machine_mem_capacity[m] ? machine_mem_capacity[m] : 1);
+                if (ratio > worst_ratio && ratio < 1.0) {
+                    worst_ratio = ratio;
+                    target = m;
+                }
             }
+            if (target != (MachineId_t)(-1)) {
+                bool success = OffloadTaskFromMachine(target);
+                offloading_in_progress = false;
+
+                if (!success) {
+                    break;  // no point retrying if nothing can be offloaded
+                }
+            } else {
+                offloading_in_progress = false;
+                break;
+            }
+        } else {
+            break;  // already inside an offload → don't offload again
         }
-        if (target != (MachineId_t)(-1)) {
-            OffloadTaskFromMachine(target);
-        }
+        // ------------------------------
     }
-    SimOutput("pMapper: Forced SLA violation: could not place task " + to_string(task_id), 0);
+
+    SimOutput("pMapper: Forced SLA violation: could not place task " + to_string(task_id), 3);
     return INVALID_VM;
 }
+
 
 void Scheduler::Init() {
     SimOutput("Scheduler::Init(): Initializing pMapper scheduler", 1);
@@ -134,7 +171,8 @@ void Scheduler::Init() {
     for (unsigned i = 0; i < active_machines && i < sorted_machines.size(); i++) {
         MachineId_t m = sorted_machines[i];
         Machine_SetState(m, S0);
-        VMId_t vm = VM_Create(LINUX, X86);
+        MachineInfo_t info = Machine_GetInfo(m);
+        VMId_t vm = VM_Create(LINUX, info.cpu);
         VM_Attach(vm, m);
         vm_location[vm] = m;
         vms.push_back(vm);
@@ -147,7 +185,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     Priority_t priority = (task_id == 0 || task_id == 64) ? HIGH_PRIORITY : MID_PRIORITY;
     SimOutput("Scheduler::NewTask(): Received task " + to_string(task_id) +
               " at time " + to_string(now), 3);
-    VMId_t vm = PlaceTask_PMapper(task_id, priority);
+    VMId_t vm = PlaceTask_PMapper(task_id, priority, -1);
     if (vm == INVALID_VM) {
         SimOutput("Scheduler::NewTask(): SLA violation for task " + to_string(task_id), 0);
     }
@@ -175,10 +213,30 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
-    SimOutput("Scheduler::PeriodicCheck(): Checking system at time " + to_string(now), 4);
+    static unordered_map<MachineId_t, Time_t> idle_start_time;
+
     for (auto m : sorted_machines) {
-        if (machine_util[m] == 0) {
-            Machine_SetState(m, S5);
+        MachineInfo_t info = Machine_GetInfo(m);
+        if (info.active_tasks > 0 || info.active_vms > 0) {
+            idle_start_time.erase(m);
+            continue;
+        }
+        
+
+        // Start or check the idle grace period
+        if (idle_start_time.find(m) == idle_start_time.end()) {
+            idle_start_time[m] = now;
+        } else if (now - idle_start_time[m] >= IDLE_GRACE_PERIOD) {
+            MachineInfo_t info_check = Machine_GetInfo(m); // re-fetch just in case
+            if (info_check.active_tasks == 0 && info_check.active_vms == 0 && info_check.s_state == S0i1) {
+                //SimOutput("Machine " + to_string(m) + " has " + to_string(info_check.active_tasks) +
+                //          " active tasks and " + to_string(info_check.active_vms) + " VMs and the P-STATE is " + to_string(info_check.p_state), 3);
+                Machine_SetState(m, S5);
+                idle_start_time.erase(m);
+            } else {
+                SimOutput("ABORT SHUTDOWN: Machine " + to_string(m) + " became active again!", 4);
+                idle_start_time.erase(m); // Reset timer — machine isn’t idle anymore
+            }
         }
     }
 }
