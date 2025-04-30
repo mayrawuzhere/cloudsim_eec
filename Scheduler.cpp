@@ -16,7 +16,7 @@ static vector<unsigned> machine_mem_capacity;
 static vector<VMId_t> vms;
 static unordered_map<VMId_t, MachineId_t> vm_location;
 static unordered_map<VMId_t, vector<TaskId_t>> vm_tasks;
-static const unsigned MAX_TASKS_PER_VM = 10;
+static const unsigned MAX_TASKS_PER_VM = 50;
 const Time_t IDLE_GRACE_PERIOD = 100000; // 0.1 seconds or adjust as needed
 static bool offloading_in_progress = false;
 
@@ -81,77 +81,120 @@ static bool OffloadTaskFromMachine(MachineId_t m) {
     return false;
 }
 
-
-
-static VMId_t PlaceTask_PMapper(TaskId_t task_id, Priority_t priority, MachineId_t original_machine) {
+static VMId_t PlaceTask_PMapper(TaskId_t task_id,
+                                Priority_t priority,
+                                MachineId_t original_machine) {
     unsigned taskMem = GetTaskMemory(task_id);
     const unsigned max_attempts = 3;
 
     for (unsigned attempt = 0; attempt < max_attempts; attempt++) {
         for (auto m : sorted_machines) {
+            // Get fresh host info
             MachineInfo_t info = Machine_GetInfo(m);
+
+            // Wake it if it’s powered down
             if (info.s_state == S5) {
                 Machine_SetState(m, S0);
+                info = Machine_GetInfo(m);
             }
-            if (machine_mem_usage[m] + taskMem > machine_mem_capacity[m])
+
+            if (info.memory_used + VM_MEMORY_OVERHEAD + taskMem
+                    > info.memory_size) {
+                // Host is truly out of RAM—skip it
                 continue;
+            }
+
+            // CPU & GPU & VM‐type checks
             if (info.cpu != RequiredCPUType(task_id))
+                continue;
+            TaskInfo_t tinfo = GetTaskInfo(task_id);
+            if (tinfo.gpu_capable && !info.gpus)
+                continue;
+            if (RequiredVMType(task_id) == AIX && info.cpu != POWER)
                 continue;
             if (m == original_machine)
                 continue;
-            if (MachineHasCapacity(m)) {
-                for (auto vm : vms) {
-                    if (vm_location[vm] == m && vm_tasks[vm].size() < MAX_TASKS_PER_VM) {
-                        VM_AddTask(vm, task_id, priority);
-                        vm_tasks[vm].push_back(task_id);
-                        machine_util[m]++;
-                        machine_mem_usage[m] += taskMem;
-                        return vm;
-                    }
-                }
-                VMId_t new_vm = VM_Create(RequiredVMType(task_id), RequiredCPUType(task_id));
-                VM_Attach(new_vm, m);
-                vm_location[new_vm] = m;
-                vms.push_back(new_vm);
-                vm_tasks[new_vm] = vector<TaskId_t>();
-                VM_AddTask(new_vm, task_id, priority);
-                vm_tasks[new_vm].push_back(task_id);
+
+            // Only cap by per‐VM task count here
+            if (!MachineHasCapacity(m))
+                continue;
+
+            // Try to pack into an existing VM on m
+            for (auto vm : vms) {
+                if (vm_location[vm] != m) 
+                    continue;
+                VMInfo_t vinfo = VM_GetInfo(vm);
+                if (vinfo.vm_type != RequiredVMType(task_id)) 
+                    continue;
+                if (vm_tasks[vm].size() >= MAX_TASKS_PER_VM)
+                    continue;
+
+                // Place on this VM
+                VM_AddTask(vm, task_id, priority);
+                vm_tasks[vm].push_back(task_id);
                 machine_util[m]++;
                 machine_mem_usage[m] += taskMem;
-                return new_vm;
+                return vm;
             }
+            
+            info = Machine_GetInfo(m);
+            if (info.memory_used + VM_MEMORY_OVERHEAD + taskMem
+                    > info.memory_size) {
+                // Host ran out of RAM between binding attempts and now
+                continue;
+            }
+
+            // Safe to spin up a fresh VM
+            VMId_t new_vm = VM_Create(RequiredVMType(task_id),
+                                      RequiredCPUType(task_id));
+            SimOutput("DEBUG: VM_Create(" +
+                      to_string(RequiredVMType(task_id)) + "," +
+                      to_string(tinfo.required_cpu) + ") → " +
+                      to_string(new_vm), 1);
+            if (new_vm == INVALID_VM) {
+                SimOutput("FAILED to create VM type " +
+                          to_string(RequiredVMType(task_id)) +
+                          " on machine " + to_string(m), 1);
+                continue;
+            }
+            VM_Attach(new_vm, m);
+            vm_location[new_vm] = m;
+            vms.push_back(new_vm);
+            vm_tasks[new_vm] = {};
+            VM_AddTask(new_vm, task_id, priority);
+            vm_tasks[new_vm].push_back(task_id);
+            machine_util[m]++;
+            machine_mem_usage[m] += taskMem;
+            return new_vm;
         }
 
-        // ------- PROTECT THIS --------
         if (!offloading_in_progress) {
             offloading_in_progress = true;
             double worst_ratio = 0.0;
-            MachineId_t target = (MachineId_t)(-1);
+            MachineId_t target = VMId_t(-1);
             for (auto m : sorted_machines) {
-                double ratio = double(machine_mem_usage[m]) / (machine_mem_capacity[m] ? machine_mem_capacity[m] : 1);
+                double ratio = double(machine_mem_usage[m]) /
+                               (machine_mem_capacity[m] ? machine_mem_capacity[m] : 1);
                 if (ratio > worst_ratio && ratio < 1.0) {
                     worst_ratio = ratio;
                     target = m;
                 }
             }
-            if (target != (MachineId_t)(-1)) {
+            if (target != VMId_t(-1)) {
                 bool success = OffloadTaskFromMachine(target);
                 offloading_in_progress = false;
-
-                if (!success) {
-                    break;  // no point retrying if nothing can be offloaded
-                }
+                if (!success) break;
             } else {
                 offloading_in_progress = false;
                 break;
             }
         } else {
-            break;  // already inside an offload → don't offload again
+            break;
         }
-        // ------------------------------
     }
 
-    SimOutput("pMapper: Forced SLA violation: could not place task " + to_string(task_id), 3);
+    SimOutput("pMapper: Forced SLA violation: could not place task " +
+              to_string(task_id), 3);
     return INVALID_VM;
 }
 
