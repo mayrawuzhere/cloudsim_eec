@@ -26,6 +26,10 @@ private:
     vector<MachineId_t> machines;
 };
 
-
+struct WakeupEvent {
+    MachineId_t machine_id;
+    VMId_t vm_id;
+    TaskId_t task_id;
+};
 
 #endif /* Scheduler_hpp */
