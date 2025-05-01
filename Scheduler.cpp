@@ -1,230 +1,251 @@
 #include "Scheduler.hpp"
 #include <vector>
 #include <unordered_map>
-#include <unordered_set>
 #include <queue>
 #include <algorithm>
 using namespace std;
 
 static bool migrating = false;
+
+// hosts, loads
 static vector<MachineId_t> activeMachines;
 static unordered_map<MachineId_t, unsigned> machineLoad;
+
+// track where each task ran
 static unordered_map<TaskId_t, MachineId_t> taskToMachine;
+static unordered_map<TaskId_t, VMId_t>      taskToVM;
+
+// VMs and their host
+static vector<VMId_t> vms;
+static unordered_map<VMId_t, MachineId_t> vm_location;
+
+// wakeup‐events
 static unordered_map<MachineId_t, queue<WakeupEvent>> wakeup_maps;
 static queue<TaskId_t> taskQueue;
 
-/* functions */
-void AssignTaskToMachine(TaskId_t task_id, MachineId_t machine_id, Priority_t priority);
+/* forward */
+void AssignTaskToMachine(TaskId_t task_id, MachineId_t mid, Priority_t priority);
 
-int provisionNewMachine(CPUType_t req_cpu, VMType_t req_vm, TaskId_t task_id, Priority_t priority) {
+int provisionNewMachine(CPUType_t req_cpu,
+                        VMType_t req_vm,
+                        TaskId_t task_id,
+                        Priority_t priority) {
     unsigned total = Machine_GetTotal();
-    // make sure it's a new machine being used
     if (activeMachines.size() >= total) {
         SimOutput("Scheduler::Provision: No more machines available", 3);
         return -1;
     }
+    unsigned taskMem = GetTaskMemory(task_id);
+
     for (MachineId_t id = 0; id < total; id++) {
-        bool alreadyActive = std::find(activeMachines.begin(), activeMachines.end(), id) != activeMachines.end();
-        if (!alreadyActive && Machine_GetCPUType(id) == req_cpu) {
-            MachineInfo_t machine_info = Machine_GetInfo(id);
-            if (machine_info.s_state != S0) {
-                Machine_SetState(id, S0);
-                SimOutput("Scheduler::Provision: Waking up machine " + to_string(id), 3);
-                VMId_t vm_id = VM_Create(req_vm, req_cpu);
-                wakeup_maps[id].push({id, vm_id, task_id});
-                return -1;
-            }
-            VMId_t newVM = VM_Create(req_vm, req_cpu);
-            VM_Attach(newVM, id);
-            activeMachines.push_back(id);
-            VM_AddTask(newVM, task_id, priority);
-            machineLoad[id] = 1;
-            SimOutput("Scheduler::Provision: Activated machine " + to_string(id), 3);
-            return activeMachines.size() - 1;
+        bool already = find(activeMachines.begin(), activeMachines.end(), id)
+                       != activeMachines.end();
+        if (already || Machine_GetCPUType(id) != req_cpu)
+            continue;
+
+        auto minfo = Machine_GetInfo(id);
+        if (minfo.s_state != S0) {
+            Machine_SetState(id, S0);
+            SimOutput("Scheduler::Provision: Waking up machine " + to_string(id), 3);
+            VMId_t vm_id = VM_Create(req_vm, req_cpu);
+            wakeup_maps[id].push({ id, vm_id, task_id });
+            return -1;
         }
+
+        // simulator‐driven memory guard
+        if (minfo.memory_used + VM_MEMORY_OVERHEAD + taskMem > minfo.memory_size) {
+            SimOutput("Provision: host " + to_string(id) +
+                      " OOM for task " + to_string(task_id), 2);
+            continue;
+        }
+
+        VMId_t newVM = VM_Create(req_vm, req_cpu);
+        if (newVM == (VMId_t)(-1)) {
+            SimOutput("Provision: VM_Create failed on machine " + to_string(id), 1);
+            continue;
+        }
+        VM_Attach(newVM, id);
+        VM_AddTask(newVM, task_id, priority);
+
+        // track
+        vms.push_back(newVM);
+        vm_location[newVM] = id;
+        taskToVM[task_id]   = newVM;
+        taskToMachine[task_id] = id;
+        activeMachines.push_back(id);
+        machineLoad[id] = 1;
+
+        SimOutput("Scheduler::Provision: Activated machine " + to_string(id), 3);
+        return id;
     }
     return -1;
 }
 
 void Scheduler::Init() {
-    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
-    SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    SimOutput("Scheduler::Init(): Initializing scheduler", 1);
+    SimOutput("Scheduler::Init(): Total machines = " + to_string(Machine_GetTotal()), 3);
     activeMachines.clear();
     machineLoad.clear();
+    vms.clear();
+    vm_location.clear();
     taskToMachine.clear();
+    taskToVM.clear();
+    wakeup_maps.clear();
+    while (!taskQueue.empty()) taskQueue.pop();
 }
 
-void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-}
+void Scheduler::MigrationComplete(Time_t, VMId_t) {}
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    SimOutput("Scheduler::NewTask(): Received new task " + to_string(task_id) + " at time " + to_string(now), 3);
-    Priority_t priority = (task_id == 0 || task_id == 64) ? HIGH_PRIORITY : MID_PRIORITY;
-    TaskInfo_t task_info = GetTaskInfo(task_id);
-    CPUType_t req_cpu = task_info.required_cpu;
+    SimOutput("Scheduler::NewTask(): Received " + to_string(task_id) + " at " + to_string(now), 3);
 
-    int targetMachine = -1;
-    unsigned minLoad = std::numeric_limits<unsigned>::max();
-    // see if we can allocate task to an existing machine
-    for (unsigned i = 0; i < activeMachines.size(); i++) {
-        MachineId_t machineId = activeMachines[i];
-        MachineInfo_t m = Machine_GetInfo(machineId);
-        if (machineLoad[activeMachines[i]] < minLoad && m.cpu == req_cpu) {
-            minLoad = machineLoad[machineId];
-            targetMachine = machineId;
+    auto tinfo = GetTaskInfo(task_id);
+    CPUType_t    req_cpu  = tinfo.required_cpu;
+    unsigned     taskMem  = tinfo.required_memory;
+    Priority_t   prio     = (task_id==0||task_id==64)?HIGH_PRIORITY:MID_PRIORITY;
+
+    MachineId_t best     = MachineId_t(-1);
+    unsigned    bestLoad = numeric_limits<unsigned>::max();
+
+    for (auto mid : activeMachines) {
+        auto minfo = Machine_GetInfo(mid);
+        if (minfo.cpu != req_cpu) continue;
+        if (minfo.memory_used + VM_MEMORY_OVERHEAD + taskMem > minfo.memory_size) continue;
+        if (machineLoad[mid] < bestLoad) {
+            bestLoad = machineLoad[mid];
+            best     = mid;
         }
     }
-    // if we can't find a suitable machine, we need to provision a new one
-    if (targetMachine == -1) {
-        targetMachine = provisionNewMachine(req_cpu, task_info.required_vm, task_id, priority);
-        SimOutput("Scheduler::NewTask(): targetMachine " + to_string(targetMachine), 3);
-        // if we still can't provision a machine, we add it to the queue
-        if (targetMachine == -1) {
+
+    if (best == MachineId_t(-1)) {
+        int p = provisionNewMachine(req_cpu, tinfo.required_vm, task_id, prio);
+        if (p < 0) {
             taskQueue.push(task_id);
-            SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " is queued for later processing", 3);
+            SimOutput("Scheduler::NewTask(): Queued " + to_string(task_id), 3);
         }
-        return;
-    }
-    
-    
-    // if we found a suitable machine, we assign the task to it
-    if (targetMachine == -1) {
-        SimOutput("Scheduler::NewTask(): No suitable machine found for task " + to_string(task_id), 3);
-        return;
-    }
-    AssignTaskToMachine(task_id, targetMachine, priority);
-    SimOutput("Scheduler::NewTask(): Task " + to_string(task_id) + " is assigned to machine " + to_string(targetMachine), 3);
-}
-
-void AssignTaskToMachine(TaskId_t task_id, MachineId_t machine_id, Priority_t priority) {
-    SimOutput("AssignTaskToMachine(): Task " + to_string(task_id) + " is assigned to machine " + to_string(machine_id), 3);
-    /* machine info */
-    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-    /* task info */
-    TaskInfo_t task_info = GetTaskInfo(task_id);
-    CPUType_t req_cpu = task_info.required_cpu;
-    VMType_t req_vm = task_info.required_vm;
-
-    /* if machine doesn't have any active vms */
-    if (machine_info.active_vms == 0) {
-        VMId_t vm_id = VM_Create(req_vm, req_cpu);
-        VM_Attach(vm_id, machine_id);
-        VM_AddTask(vm_id, task_id, priority);
-        SimOutput("AssignTaskToMachine(): Created new VM " + to_string(vm_id) + " on machine " + to_string(machine_id), 3);
     } else {
-        /* if machine has active vms */
-        for (VMId_t i = 0; i < machine_info.active_vms; i++) {
-            VMInfo_t vm_info = VM_GetInfo(i);
-            if (vm_info.cpu == req_cpu) {
-                VM_AddTask(vm_info.vm_id, task_id, priority);
-                SimOutput("AssignTaskToMachine(): Added task " + to_string(task_id) + " to VM " + to_string(vm_info.vm_id) + " on machine " + to_string(machine_id), 3);
-                break;
-            }
-        }
+        AssignTaskToMachine(task_id, best, prio);
     }
-    /* update task to machine mapping */
-    taskToMachine[task_id] = machine_id;
-    machineLoad[machine_id]++;
 }
 
-void Scheduler::PeriodicCheck(Time_t now) {
+void AssignTaskToMachine(TaskId_t task_id, MachineId_t mid, Priority_t priority) {
+    SimOutput("AssignTaskToMachine(): Task " + to_string(task_id) +
+              " → machine " + to_string(mid), 3);
 
+    auto tinfo = GetTaskInfo(task_id);
+    unsigned taskMem = tinfo.required_memory;
+    auto minfo = Machine_GetInfo(mid);
+
+    if (minfo.memory_used + VM_MEMORY_OVERHEAD + taskMem > minfo.memory_size) {
+        SimOutput("AssignTask: not enough RAM on " + to_string(mid), 2);
+        taskQueue.push(task_id);
+        return;
+    }
+
+    // try existing VMs
+    for (auto vm : vms) {
+        if (vm_location[vm] != mid) continue;
+        auto vinfo = VM_GetInfo(vm);
+        if (vinfo.cpu != tinfo.required_cpu) continue;
+        VM_AddTask(vm, task_id, priority);
+        taskToVM[task_id]   = vm;
+        taskToMachine[task_id] = mid;
+        machineLoad[mid]++;
+        return;
+    }
+
+    // else create new VM
+    VMId_t vm = VM_Create(tinfo.required_vm, tinfo.required_cpu);
+    VM_Attach(vm, mid);
+    VM_AddTask(vm, task_id, priority);
+    vms.push_back(vm);
+    vm_location[vm]      = mid;
+    taskToVM[task_id]    = vm;
+    taskToMachine[task_id] = mid;
+    machineLoad[mid]++;
 }
+
+void Scheduler::PeriodicCheck(Time_t) {}
 
 void Scheduler::Shutdown(Time_t time) {
-    for (auto & vm: vms) {
-        VM_Shutdown(vm);
-    }
+    for (auto vm : vms) VM_Shutdown(vm);
     SimOutput("SimulationComplete(): Finished!", 4);
     SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
-    TaskInfo_t task_info = GetTaskInfo(task_id);
-    CPUType_t req_cpu = task_info.required_cpu;
-    if (taskToMachine.find(task_id) != taskToMachine.end()){
-         MachineId_t machineIndex = taskToMachine[task_id];
-         if (machineLoad[machineIndex] > 0)
-             machineLoad[machineIndex]--;
-         taskToMachine.erase(task_id);
-    }
-    if (taskQueue.size() > 0) {
-        TaskId_t nextTask = taskQueue.front();
-        TaskInfo_t nextTaskInfo = GetTaskInfo(nextTask);
-        CPUType_t nextReqCpu = nextTaskInfo.required_cpu;
-        if (nextReqCpu != req_cpu) {
-            SimOutput("Scheduler::TaskComplete(): Task " + to_string(nextTask) + " has a different CPU type than the completed task", 3);
-            return;
+    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) +
+              " complete at " + to_string(now), 4);
+
+    // only remove if VM really has it
+    auto itVM = taskToVM.find(task_id);
+    if (itVM != taskToVM.end()) {
+        VMId_t vm = itVM->second;
+        auto vinfo = VM_GetInfo(vm);
+        if (find(vinfo.active_tasks.begin(),
+                 vinfo.active_tasks.end(),
+                 task_id) != vinfo.active_tasks.end()) {
+            VM_RemoveTask(vm, task_id);
+        } else {
+            SimOutput("Warning: tried to remove task " + to_string(task_id) +
+                      " from VM " + to_string(vm) + " but it was not present", 1);
         }
-        taskQueue.pop();
-        SimOutput("Scheduler::TaskComplete(): Task " + to_string(nextTask) + " is dequeued for processing", 3);
-        NewTask(now, nextTask);
+        taskToVM.erase(itVM);
     }
 
+    // free host load
+    auto itM = taskToMachine.find(task_id);
+    if (itM != taskToMachine.end()) {
+        MachineId_t mid = itM->second;
+        if (machineLoad[mid] > 0) machineLoad[mid]--;
+        taskToMachine.erase(itM);
+    }
+
+    // retry queued tasks
+    queue<TaskId_t> pending;
+    swap(pending, taskQueue);
+    while (!pending.empty()) {
+        TaskId_t next = pending.front(); pending.pop();
+        SimOutput("Scheduler::TaskComplete(): Retrying queued task " + to_string(next), 3);
+        NewTask(now, next);
+    }
 }
 
 static Scheduler Scheduler;
 
-void InitScheduler() {
-    SimOutput("InitScheduler(): Initializing scheduler", 4);
-    Scheduler.Init();
-}
-
-void HandleNewTask(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + " at time " + to_string(time), 4);
-    Scheduler.NewTask(time, task_id);
-}
-
-void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + " completed at time " + to_string(time), 4);
-    Scheduler.TaskComplete(time, task_id);
-}
-
-void MemoryWarning(Time_t time, MachineId_t machine_id) {
-    SimOutput("MemoryWarning(): Overflow at " + to_string(machine_id) + " was detected at time " + to_string(time), 0);
-}
-
-void MigrationDone(Time_t time, VMId_t vm_id) {
-    SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
-    Scheduler.MigrationComplete(time, vm_id);
-    migrating = false;
-}
-
-void SchedulerCheck(Time_t time) {
-    SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
-    Scheduler.PeriodicCheck(time);
-}
-
+void InitScheduler()                       { Scheduler.Init(); }
+void HandleNewTask(Time_t t, TaskId_t id)       { Scheduler.NewTask(t, id); }
+void HandleTaskCompletion(Time_t t, TaskId_t id){ Scheduler.TaskComplete(t, id); }
+void MemoryWarning(Time_t, MachineId_t)          {}
+void MigrationDone(Time_t t, VMId_t v)           { Scheduler.MigrationComplete(t, v); migrating=false; }
+void SchedulerCheck(Time_t t)                   { Scheduler.PeriodicCheck(t); }
 void SimulationComplete(Time_t time) {
-    cout << "SLA violation report" << endl;
     cout << "SLA0: " << GetSLAReport(SLA0) << "%" << endl;
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
     cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
-    cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
-    cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
-    SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
-    
+    cout << "Total Energy: " << Machine_GetClusterEnergy() << " KW-Hour" << endl;
+    cout << "Simulation finished at " << double(time)/1000000 << " seconds" << endl;
     Scheduler.Shutdown(time);
 }
-
-void SLAWarning(Time_t time, TaskId_t task_id) {
-}
-
+void SLAWarning(Time_t, TaskId_t)                {}
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    SimOutput("StateChangeComplete(): Machine " + to_string(machine_id) + " is ready at time " + to_string(time), 4);
-    if (wakeup_maps.find(machine_id) != wakeup_maps.end()) {
-        auto& q = wakeup_maps[machine_id];
-        while (!q.empty()) {
-            WakeupEvent e = q.front(); q.pop();
-            VM_Attach(e.vm_id, machine_id);
-            VM_AddTask(e.vm_id, e.task_id, HIGH_PRIORITY);
-            taskToMachine[e.task_id] = machine_id;
-            machineLoad[machine_id]++; 
-            SimOutput("StateChangeComplete(): Task " + to_string(e.task_id) +
-                      " assigned to machine " + to_string(machine_id), 3);
+    SimOutput("StateChangeComplete(): Machine " + to_string(machine_id) +
+              " ready at time " + to_string(time), 4);
+    auto it = wakeup_maps.find(machine_id);
+    if (it == wakeup_maps.end()) return;
+    auto &q = it->second;
+    while (!q.empty()) {
+        auto e = q.front(); q.pop();
+        auto tinfo = GetTaskInfo(e.task_id);
+        auto minfo = Machine_GetInfo(machine_id);
+        if (minfo.memory_used + VM_MEMORY_OVERHEAD + tinfo.required_memory > minfo.memory_size) {
+            SimOutput("StateChangeComplete: OOM for task " + to_string(e.task_id), 2);
+            continue;
         }
-        wakeup_maps.erase(machine_id); // cleanup if queue is empty
+        VM_Attach(e.vm_id, machine_id);
+        VM_AddTask(e.vm_id, e.task_id, HIGH_PRIORITY);
+        taskToVM[e.task_id]    = e.vm_id;
+        taskToMachine[e.task_id] = machine_id;
+        machineLoad[machine_id]++;
     }
+    wakeup_maps.erase(machine_id);
 }
